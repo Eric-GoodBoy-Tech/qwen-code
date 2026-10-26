@@ -41,7 +41,8 @@ export interface AutoMemoryExtractResult {
     | 'queued'
     | 'memory_tool'
     | 'memory_pressure'
-    | 'session_mismatch';
+    | 'session_mismatch'
+    | 'noop_cooldown';
   systemMessage?: string;
   cursor: AutoMemoryExtractCursor;
 }

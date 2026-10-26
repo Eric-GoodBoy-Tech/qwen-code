@@ -304,6 +304,8 @@ const DREAM_LOCK_STALE_MS = 60 * 60 * 1000; // 1 hour
 // MAX_FILES_PER_RUN-sized batches never trips the limit.
 const MIGRATION_STALL_LIMIT = 3;
 const SESSION_SCAN_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+// Turns to skip after an extractor run that wrote nothing (#11471/#13004 phase 1).
+const DEFAULT_EXTRACT_NOOP_SKIP_TURNS = 2;
 const activeMigrationDomains = new Set<string>();
 
 const WRITE_TOOL_NAMES = new Set([
@@ -656,6 +658,15 @@ export class MemoryManager {
     { taskId: string; params: ScheduleExtractParams }
   >();
 
+  // ── Extract no-op cooldown ─────────────────────────────────────────────────
+  // Extraction runs at most once per successful user turn, and a run that
+  // writes nothing still costs a full forked-agent prompt. After such a no-op,
+  // skip the next N successful turns so idle chatter does not re-fork the
+  // extractor on every turn (#11471 / #13004 phase 1). The env var overrides the
+  // default; 0 disables the cooldown.
+  private readonly extractNoopCooldown = new Map<string, number>();
+  private readonly extractNoopSkipTurns: number;
+
   // ── Skill-review in-flight dedup ─────────────────────────────────────────────
   private readonly skillReviewInFlightByProject = new Map<string, string>();
 
@@ -697,6 +708,14 @@ export class MemoryManager {
 
   constructor(sessionScanner: SessionScannerFn = defaultSessionScanner) {
     this.sessionScanner = sessionScanner;
+    const rawSkipTurns = process.env['QWEN_CODE_MEMORY_EXTRACT_NOOP_SKIP_TURNS'];
+    const parsedSkipTurns =
+      rawSkipTurns === undefined || rawSkipTurns.trim() === ''
+        ? DEFAULT_EXTRACT_NOOP_SKIP_TURNS
+        : Number(rawSkipTurns);
+    this.extractNoopSkipTurns = Number.isFinite(parsedSkipTurns)
+      ? Math.max(0, Math.min(20, Math.floor(parsedSkipTurns)))
+      : DEFAULT_EXTRACT_NOOP_SKIP_TURNS;
   }
   // ─── Subscribe ───────────────────────────────────────────────────────────────────
 
@@ -1194,6 +1213,35 @@ export class MemoryManager {
       } as never;
     }
 
+    if (this.extractNoopSkipTurns > 0) {
+      const remaining = this.extractNoopCooldown.get(params.projectRoot) ?? 0;
+      if (remaining > 0) {
+        this.extractNoopCooldown.set(params.projectRoot, remaining - 1);
+        const cooldownRecord = makeTaskRecord(
+          'extract',
+          params.projectRoot,
+          params.sessionId,
+        );
+        this.storeWith(cooldownRecord, {
+          status: 'skipped',
+          progressText: `Skipped: no-op extraction cooldown (${remaining - 1} turn(s) left).`,
+          metadata: {
+            skippedReason: 'noop_cooldown',
+            historyLength: params.history.length,
+            cooldownRemaining: remaining - 1,
+          },
+        });
+        return {
+          touchedTopics: [],
+          skippedReason: 'noop_cooldown' as const,
+          cursor: {
+            sessionId: params.sessionId,
+            updatedAt: (params.now ?? new Date()).toISOString(),
+          },
+        } as never;
+      }
+    }
+
     const record = makeTaskRecord(
       'extract',
       params.projectRoot,
@@ -1282,6 +1330,19 @@ export class MemoryManager {
       }
 
       const result = await runAutoMemoryExtract(params);
+      if (!result.skippedReason && result.touchedTopics.length === 0) {
+        if (this.extractNoopSkipTurns > 0) {
+          this.extractNoopCooldown.set(
+            params.projectRoot,
+            this.extractNoopSkipTurns,
+          );
+          debugLogger.debug(
+            `Managed auto-memory extract wrote nothing; skipping the next ${this.extractNoopSkipTurns} turn(s).`,
+          );
+        }
+      } else {
+        this.extractNoopCooldown.delete(params.projectRoot);
+      }
       if (result.touchedUserScope && params.config) {
         await this.recordUserMutation(
           params.projectRoot,
