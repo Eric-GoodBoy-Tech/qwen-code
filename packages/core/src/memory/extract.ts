@@ -42,7 +42,8 @@ export interface AutoMemoryExtractResult {
     | 'memory_tool'
     | 'memory_pressure'
     | 'session_mismatch'
-    | 'noop_cooldown';
+    | 'noop_cooldown'
+    | 'throttled';
   systemMessage?: string;
   cursor: AutoMemoryExtractCursor;
 }

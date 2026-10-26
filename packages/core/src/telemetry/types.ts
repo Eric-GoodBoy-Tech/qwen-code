@@ -1808,7 +1808,8 @@ export class MemoryExtractEvent implements BaseTelemetryEvent {
     | 'memory_tool'
     | 'memory_pressure'
     | 'session_mismatch'
-    | 'noop_cooldown';
+    | 'noop_cooldown'
+    | 'throttled';
   patches_count: number;
   touched_topics: string;
   duration_ms: number;
@@ -1822,7 +1823,8 @@ export class MemoryExtractEvent implements BaseTelemetryEvent {
       | 'memory_tool'
       | 'memory_pressure'
       | 'session_mismatch'
-      | 'noop_cooldown';
+      | 'noop_cooldown'
+      | 'throttled';
     patches_count: number;
     touched_topics: string[];
     duration_ms: number;

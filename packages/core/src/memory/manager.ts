@@ -305,7 +305,11 @@ const DREAM_LOCK_STALE_MS = 60 * 60 * 1000; // 1 hour
 const MIGRATION_STALL_LIMIT = 3;
 const SESSION_SCAN_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 // Turns to skip after an extractor run that wrote nothing (#11471/#13004 phase 1).
-const DEFAULT_EXTRACT_NOOP_SKIP_TURNS = 2;
+const DEFAULT_EXTRACT_NOOP_SKIP_TURNS = 4;
+// Minimum wall-clock gap between automatic extractor runs for one project.
+// Group chats send bursts of tiny messages; without this the extractor forks
+// once every turn even when nothing durable has been said.
+const DEFAULT_EXTRACT_MIN_INTERVAL_MS = 5 * 60 * 1000;
 const activeMigrationDomains = new Set<string>();
 
 const WRITE_TOOL_NAMES = new Set([
@@ -666,6 +670,9 @@ export class MemoryManager {
   // default; 0 disables the cooldown.
   private readonly extractNoopCooldown = new Map<string, number>();
   private readonly extractNoopSkipTurns: number;
+  // Last real extraction run per project, for the wall-clock cadence gate.
+  private readonly extractLastRunAt = new Map<string, number>();
+  private readonly extractMinIntervalMs: number;
 
   // ── Skill-review in-flight dedup ─────────────────────────────────────────────
   private readonly skillReviewInFlightByProject = new Map<string, string>();
@@ -716,6 +723,15 @@ export class MemoryManager {
     this.extractNoopSkipTurns = Number.isFinite(parsedSkipTurns)
       ? Math.max(0, Math.min(20, Math.floor(parsedSkipTurns)))
       : DEFAULT_EXTRACT_NOOP_SKIP_TURNS;
+    const rawMinInterval =
+      process.env['QWEN_CODE_MEMORY_EXTRACT_MIN_INTERVAL_MS'];
+    const parsedMinInterval =
+      rawMinInterval === undefined || rawMinInterval.trim() === ''
+        ? DEFAULT_EXTRACT_MIN_INTERVAL_MS
+        : Number(rawMinInterval);
+    this.extractMinIntervalMs = Number.isFinite(parsedMinInterval)
+      ? Math.max(0, Math.min(60 * 60 * 1000, Math.floor(parsedMinInterval)))
+      : DEFAULT_EXTRACT_MIN_INTERVAL_MS;
   }
   // ─── Subscribe ───────────────────────────────────────────────────────────────────
 
@@ -1213,6 +1229,38 @@ export class MemoryManager {
       } as never;
     }
 
+    const nowMs = (params.now ?? new Date()).getTime();
+    const lastRunAt = this.extractLastRunAt.get(params.projectRoot) ?? 0;
+    if (
+      this.extractMinIntervalMs > 0 &&
+      lastRunAt > 0 &&
+      nowMs - lastRunAt < this.extractMinIntervalMs
+    ) {
+      const waitLeftMs = this.extractMinIntervalMs - (nowMs - lastRunAt);
+      const throttledRecord = makeTaskRecord(
+        'extract',
+        params.projectRoot,
+        params.sessionId,
+      );
+      this.storeWith(throttledRecord, {
+        status: 'skipped',
+        progressText: `Skipped: extractor cadence gate (${Math.ceil(waitLeftMs / 1000)}s left).`,
+        metadata: {
+          skippedReason: 'throttled',
+          historyLength: params.history.length,
+          waitLeftMs,
+        },
+      });
+      return {
+        touchedTopics: [],
+        skippedReason: 'throttled' as const,
+        cursor: {
+          sessionId: params.sessionId,
+          updatedAt: (params.now ?? new Date()).toISOString(),
+        },
+      } as never;
+    }
+
     if (this.extractNoopSkipTurns > 0) {
       const remaining = this.extractNoopCooldown.get(params.projectRoot) ?? 0;
       if (remaining > 0) {
@@ -1329,6 +1377,7 @@ export class MemoryManager {
         };
       }
 
+      this.extractLastRunAt.set(params.projectRoot, t0);
       const result = await runAutoMemoryExtract(params);
       if (!result.skippedReason && result.touchedTopics.length === 0) {
         if (this.extractNoopSkipTurns > 0) {
