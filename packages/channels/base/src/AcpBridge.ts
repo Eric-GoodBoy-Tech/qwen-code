@@ -121,8 +121,6 @@ export class AcpBridge extends EventEmitter implements ChannelAgentBridge {
     string,
     Map<string, string>
   >();
-  private channelLoopMcpRegistered = false;
-  private channelLoopMcpRegistration: Promise<void> | null = null;
   /**
    * Text queued by `queueMidTurnMessage` and handed to the ACP child on its
    * next `craft/drainMidTurnQueue`, when the child asks between tool batches.
