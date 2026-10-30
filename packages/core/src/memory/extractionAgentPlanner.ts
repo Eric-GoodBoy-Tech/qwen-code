@@ -8,6 +8,8 @@ import type { Config } from '../config/config.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
 import { runForkedAgent, getCacheSafeParams } from '../agents/forkedAgent.js';
 import { buildFunctionResponseParts } from '../tools/agent/fork-subagent.js';
+import { slimCompactionInput } from '../services/compactionInputSlimming.js';
+import { sliceExtractWindow } from './extract-window.js';
 import type { Content } from '@google/genai';
 import {
   MEMORY_CATEGORY_SECTION,
@@ -297,18 +299,46 @@ function touchedTopicsFromFilePaths(
   };
 }
 
+export interface StableExtractWindowInput {
+  /**
+   * Full curated parent history, materialized at extraction execution time.
+   * Only passed when the stable-window mode is on.
+   */
+  curatedHistory: Content[];
+  /** Start index pinned for the current extraction epoch. */
+  windowStartCurated: number;
+}
+
 export async function runAutoMemoryExtractionByAgent(
   config: Config,
   projectRoot: string,
+  options?: { stableWindow?: StableExtractWindowInput },
 ): Promise<AutoMemoryExtractionExecutionResult> {
-  const cacheSafe = getCacheSafeParams(config.getSessionId());
-  if (!cacheSafe) {
-    throw new Error(
-      'runAutoMemoryExtractionByAgent: no cache-safe params available; ' +
-        'extraction must run after a completed main turn.',
+  const stableWindow = options?.stableWindow;
+  let extraHistory: Content[];
+  if (stableWindow) {
+    // Same sanitization as the legacy path (slimCompactionInput applied to the
+    // curated history, then buildAgentHistory), just over the pinned window
+    // instead of the last 40 entries: the window only grows at the tail, so
+    // the inherited prefix can be reused by provider prefix caching.
+    const { slimmedHistory } = slimCompactionInput(
+      sliceExtractWindow(
+        stableWindow.curatedHistory,
+        stableWindow.windowStartCurated,
+      ),
+      config.getEffectiveInputModalities(),
     );
+    extraHistory = buildAgentHistory(slimmedHistory);
+  } else {
+    const cacheSafe = getCacheSafeParams(config.getSessionId());
+    if (!cacheSafe) {
+      throw new Error(
+        'runAutoMemoryExtractionByAgent: no cache-safe params available; ' +
+          'extraction must run after a completed main turn.',
+      );
+    }
+    extraHistory = buildAgentHistory(cacheSafe.history);
   }
-  const extraHistory = buildAgentHistory(cacheSafe.history);
 
   const { topicSummaries, keywordVocabularySnapshot } =
     await buildExistingMemoryContext(projectRoot);

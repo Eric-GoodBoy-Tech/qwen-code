@@ -5,6 +5,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Content } from '@google/genai';
 import type { Config } from '../config/config.js';
 import { runAutoMemoryExtractionByAgent } from './extractionAgentPlanner.js';
 import { scanAutoMemoryTopicDocuments } from './structured-scan.js';
@@ -210,6 +211,69 @@ describe('runAutoMemoryExtractionByAgent', () => {
         ],
       },
       { role: 'model', parts: [{ text: 'Understood.' }] },
+    ]);
+  });
+
+  it('inherits the pinned curated window instead of the 40-entry cache-safe tail', async () => {
+    const curated: Content[] = [
+      { role: 'user', parts: [{ text: 'very old turn' }] },
+      { role: 'model', parts: [{ text: 'very old reply' }] },
+      { role: 'user', parts: [{ text: 'recent turn' }] },
+      { role: 'model', parts: [{ text: 'recent reply' }] },
+    ];
+    const configWithModalities = {
+      ...mockConfig,
+      getEffectiveInputModalities: vi.fn().mockReturnValue({}),
+    } as unknown as Config;
+    vi.mocked(runForkedAgent).mockResolvedValue({
+      status: 'completed',
+      filesTouched: [],
+      filesWritten: [],
+    });
+
+    await runAutoMemoryExtractionByAgent(configWithModalities, '/tmp', {
+      stableWindow: { curatedHistory: curated, windowStartCurated: 2 },
+    });
+
+    expect(getCacheSafeParams).not.toHaveBeenCalled();
+    expect(vi.mocked(runForkedAgent).mock.calls[0]?.[0].extraHistory).toEqual([
+      { role: 'user', parts: [{ text: 'recent turn' }] },
+      { role: 'model', parts: [{ text: 'recent reply' }] },
+    ]);
+  });
+
+  it('slims unsupported media out of the pinned window like the legacy path', async () => {
+    const curated: Content[] = [
+      {
+        role: 'user',
+        parts: [
+          {
+            inlineData: {
+              mimeType: 'image/png',
+              data: 'aGVsbG8=',
+            },
+          },
+        ],
+      },
+      { role: 'model', parts: [{ text: 'Got the screenshot.' }] },
+    ];
+    const configWithModalities = {
+      ...mockConfig,
+      getEffectiveInputModalities: vi.fn().mockReturnValue({}),
+    } as unknown as Config;
+    vi.mocked(runForkedAgent).mockResolvedValue({
+      status: 'completed',
+      filesTouched: [],
+      filesWritten: [],
+    });
+
+    await runAutoMemoryExtractionByAgent(configWithModalities, '/tmp', {
+      stableWindow: { curatedHistory: curated, windowStartCurated: 0 },
+    });
+
+    expect(vi.mocked(runForkedAgent).mock.calls[0]?.[0].extraHistory).toEqual([
+      { role: 'user', parts: [{ text: '[image: image/png]' }] },
+      { role: 'model', parts: [{ text: 'Got the screenshot.' }] },
     ]);
   });
 

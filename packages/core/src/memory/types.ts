@@ -94,6 +94,28 @@ export interface UserAutoMemoryMetadata {
 
 export interface AutoMemoryExtractCursor {
   sessionId?: string;
+  /**
+   * Index into the RAW session history up to which extraction has been
+   * processed. Raw coordinates — never use it to slice curated history.
+   */
   processedOffset?: number;
   updatedAt: string;
+  /**
+   * Stable extraction window epoch. Bumped whenever the window start is
+   * rebased (session change, compaction, restart, head mismatch, budget
+   * overflow), so consecutive runs inside one epoch share an append-only
+   * prompt prefix.
+   */
+  epoch?: number;
+  /** Start index of the extractor window in CURATED-history coordinates. */
+  windowStartCurated?: number;
+  /**
+   * Curated-history length already handed to the extractor for this epoch.
+   * Used so a rebase never skips content that no earlier run covered.
+   */
+  coveredCurated?: number;
+  /** Hash of the curated message at `windowStartCurated`; mismatch => rebase. */
+  windowHeadHash?: string;
+  /** Process instance that wrote this window state; restart => rebase. */
+  windowProcessId?: string;
 }

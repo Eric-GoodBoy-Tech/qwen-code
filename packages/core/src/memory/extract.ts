@@ -18,7 +18,18 @@ import {
   ensureAutoMemoryScaffold,
   ensureUserAutoMemoryScaffold,
 } from './store.js';
-import { runAutoMemoryExtractionByAgent } from './extractionAgentPlanner.js';
+import {
+  runAutoMemoryExtractionByAgent,
+  type StableExtractWindowInput,
+} from './extractionAgentPlanner.js';
+import {
+  decideExtractWindow,
+  isStableExtractionWindowEnabled,
+  pickExtractWindowState,
+  resolveExtractWindowMaxChars,
+  toExtractWindowCursorFields,
+  type ExtractWindowState,
+} from './extract-window.js';
 import {
   rebuildManagedAutoMemoryIndex,
   rebuildUserAutoMemoryIndex,
@@ -97,6 +108,48 @@ async function writeExtractCursor(
   );
 }
 
+/**
+ * Deep-copies the parent curated history so a stable extraction window can be
+ * pinned into it. Only called when the stable-window mode is on and only at
+ * extraction execution time — never per turn.
+ */
+function materializeCuratedHistory(config: Config): Content[] | undefined {
+  try {
+    const curated = config.getLlmClient?.()?.getHistory?.(true);
+    if (Array.isArray(curated)) {
+      return curated;
+    }
+  } catch (error) {
+    debugLogger.debug(
+      `Stable extractor window: curated history unavailable (${error instanceof Error ? error.message : String(error)}).`,
+    );
+  }
+  return undefined;
+}
+
+/**
+ * Window state carried across a run that fell back to the legacy path (or a
+ * run that never reached the extractor), so the epoch is not silently lost.
+ */
+function carryExtractWindowFields(
+  cursor: AutoMemoryExtractCursor,
+  sessionId: string,
+): Partial<AutoMemoryExtractCursor> | undefined {
+  if (cursor.sessionId !== sessionId) {
+    return undefined;
+  }
+  const state = pickExtractWindowState(cursor);
+  if (!state) {
+    return undefined;
+  }
+  return {
+    ...state,
+    ...(typeof cursor.windowProcessId === 'string'
+      ? { windowProcessId: cursor.windowProcessId }
+      : {}),
+  };
+}
+
 async function bumpMetadata(
   projectRoot: string,
   now: Date,
@@ -164,6 +217,12 @@ export async function runAutoMemoryExtract(params: {
   // text was never read — fork agent context comes from the session-scoped
   // cache-safe params lookup.
   const currentCursor = await readExtractCursor(params.projectRoot);
+  const stableWindowEnabled = isStableExtractionWindowEnabled();
+  // The stable window lives in CURATED coordinates; `processedOffset` stays in
+  // RAW coordinates for the cadence/no-new-messages logic below.
+  const carriedWindowFields = stableWindowEnabled
+    ? carryExtractWindowFields(currentCursor, params.sessionId)
+    : undefined;
   const rawOffset =
     currentCursor.sessionId === params.sessionId
       ? (currentCursor.processedOffset ?? 0)
@@ -186,6 +245,7 @@ export async function runAutoMemoryExtract(params: {
       sessionId: params.sessionId,
       processedOffset: params.history.length,
       updatedAt: now.toISOString(),
+      ...(carriedWindowFields ?? {}),
     };
     await writeExtractCursor(params.projectRoot, cursor);
     return { touchedTopics: [], cursor };
@@ -198,10 +258,39 @@ export async function runAutoMemoryExtract(params: {
   );
   if (lateMismatch) return lateMismatch;
 
-  const agentResult = await runAutoMemoryExtractionByAgent(
-    params.config,
-    params.projectRoot,
-  );
+  let stableWindow: StableExtractWindowInput | undefined;
+  let windowState: ExtractWindowState | undefined;
+  if (stableWindowEnabled) {
+    const curatedHistory = materializeCuratedHistory(params.config);
+    if (curatedHistory) {
+      const decision = decideExtractWindow({
+        cursor: currentCursor,
+        sessionId: params.sessionId,
+        curated: curatedHistory,
+        maxChars: resolveExtractWindowMaxChars(),
+      });
+      windowState = decision.state;
+      stableWindow = {
+        curatedHistory,
+        windowStartCurated: decision.state.windowStartCurated,
+      };
+      if (decision.rebased) {
+        debugLogger.debug(
+          `Stable extractor window rebased (${decision.reason}) to curated[${decision.state.windowStartCurated}] epoch ${decision.state.epoch} of ${curatedHistory.length} entries.`,
+        );
+      }
+    } else {
+      debugLogger.debug(
+        'Stable extractor window unavailable: no live curated history; falling back to the legacy 40-entry extractor tail.',
+      );
+    }
+  }
+
+  const agentResult = stableWindow
+    ? await runAutoMemoryExtractionByAgent(params.config, params.projectRoot, {
+        stableWindow,
+      })
+    : await runAutoMemoryExtractionByAgent(params.config, params.projectRoot);
 
   if (agentResult.touchedTopics.length > 0) {
     await bumpMetadata(
@@ -248,6 +337,9 @@ export async function runAutoMemoryExtract(params: {
     sessionId: params.sessionId,
     processedOffset: madeGenuineProgress ? params.history.length : startOffset,
     updatedAt: now.toISOString(),
+    ...(windowState
+      ? toExtractWindowCursorFields(windowState)
+      : (carriedWindowFields ?? {})),
   };
   await writeExtractCursor(params.projectRoot, cursor);
 
