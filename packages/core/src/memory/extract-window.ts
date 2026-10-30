@@ -171,6 +171,36 @@ export function toExtractWindowCursorFields(
   };
 }
 
+/**
+ * Budget-fitting epoch seed.
+ *
+ * The legacy seed (the newest 40 entries) can by itself exceed the window
+ * budget in a busy session — measured curated windows there reach ~228k chars
+ * — and a seed over budget would rebase on every single run, i.e. exactly the
+ * zero-reuse loop this mode exists to remove. Seed instead from the newest
+ * entries that fit into HALF the budget (always at least one entry, never more
+ * than the legacy 40): the other half is headroom for appended turns before the
+ * next rebase, so a rebase is an occasional event rather than the steady state.
+ */
+function computeSeedWindowStart(curated: Content[], maxChars: number): number {
+  const budget = Math.max(1, Math.floor(maxChars / 2));
+  let usedChars = 0;
+  let entries = 0;
+  let start = curated.length;
+  for (let i = curated.length - 1; i >= 0; i--) {
+    if (entries >= EXTRACT_WINDOW_SEED_ENTRIES) break;
+    const chars = estimateContentChars(
+      curated[i],
+      DEFAULT_IMAGE_TOKEN_ESTIMATE,
+    );
+    if (entries > 0 && usedChars + chars > budget) break;
+    usedChars += chars;
+    entries++;
+    start = i;
+  }
+  return start;
+}
+
 export function decideExtractWindow(params: {
   cursor: AutoMemoryExtractCursor;
   sessionId: string;
@@ -181,16 +211,18 @@ export function decideExtractWindow(params: {
   const { cursor, sessionId, curated, maxChars } = params;
   const processId = params.processId ?? PROCESS_INSTANCE_ID;
   const length = curated.length;
-  const seedStart = Math.max(0, length - EXTRACT_WINDOW_SEED_ENTRIES);
+  const seedStart = computeSeedWindowStart(curated, maxChars);
   const existing = pickExtractWindowState(cursor);
 
   const rebase = (reason: ExtractWindowRebaseReason): ExtractWindowDecision => {
     let windowStartCurated = seedStart;
-    // Budget overflow is the only rebase that follows a still-append-only
-    // history, so `coveredCurated` is trustworthy there: clamp the new start
-    // to it so no turn that no earlier run included is skipped.
+    // Never skip turns that no earlier run covered: when the previous window's
+    // covered index is older than the budget-fitting seed, start there instead.
+    // Safe for every rebase that still trusts the curated tail ordering
+    // (restart, head rewrite, shrink, budget) — a session change is the one
+    // case where `coveredCurated` belongs to another transcript.
     if (
-      reason === 'budget_overflow' &&
+      reason !== 'session_changed' &&
       existing !== undefined &&
       existing.coveredCurated > 0 &&
       existing.coveredCurated < seedStart

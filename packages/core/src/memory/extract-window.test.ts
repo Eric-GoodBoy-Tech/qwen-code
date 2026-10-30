@@ -11,8 +11,8 @@ import {
   DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
   EXTRACT_STABLE_WINDOW_ENV,
   EXTRACT_WINDOW_MAX_CHARS_ENV,
-  EXTRACT_WINDOW_SEED_ENTRIES,
   decideExtractWindow,
+  estimateExtractWindowChars,
   getExtractWindowHeadHash,
   getExtractWindowProcessId,
   isStableExtractionWindowEnabled,
@@ -272,7 +272,8 @@ describe('stable extraction window', () => {
     expect(decision.rebased).toBe(true);
     expect(decision.reason).toBe('budget_overflow');
     expect(decision.state.epoch).toBe(4);
-    // seedWouldBe(160) is newer than the last covered entry, so clamp to 100.
+    // The budget-fitting seed would start after the last covered entry, so the
+    // no-loss clamp starts at 100 instead.
     expect(decision.state.windowStartCurated).toBe(100);
     const window = sliceExtractWindow(
       longCurated,
@@ -282,27 +283,88 @@ describe('stable extraction window', () => {
     expect(window[window.length - 1]).toEqual(longCurated[199]);
   });
 
-  it('rebases an over-budget window back to the 40-entry seed when coverage is recent', () => {
-    const curated = buildHistory(120);
+  it('applies the no-loss clamp to head_changed rebases too', () => {
+    // A pinned window from entry 0 covered 100 entries; the head at 0 changed
+    // (compaction/rewrite) so the epoch must rebase, but entries 100..199 were
+    // never covered and must stay in the new window.
+    const curated = buildHistory(200);
     const pinnedAtZero: ExtractWindowState = {
-      epoch: 1,
+      epoch: 2,
       windowStartCurated: 0,
       coveredCurated: 100,
       windowHeadHash: getExtractWindowHeadHash(curated, 0),
     };
+    const rewritten = buildHistory(200, 'rewritten');
     const decision = decideExtractWindow({
       cursor: persistWindow(pinnedAtZero),
       sessionId: SESSION_ID,
-      curated,
-      maxChars: 1,
+      curated: rewritten,
+      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
 
-    expect(decision.reason).toBe('budget_overflow');
-    expect(decision.state.windowStartCurated).toBe(120 - 40);
-    // New turns (100..119) are inside the fresh seed window.
+    expect(decision.reason).toBe('head_changed');
+    // Budget-fitting seed would be rewritten[160], but entry 100 is the oldest
+    // never-covered turn.
+    expect(decision.state.windowStartCurated).toBe(100);
+  });
+
+  it('seeds a 40-entry window that by itself exceeds the budget with budget headroom', () => {
+    // A busy session: 40 entries of ~10k chars each = ~400k chars, well over
+    // the 200k budget. A legacy 40-entry seed would rebase on every run.
+    const perEntryChars = 10_000;
+    const curated: Content[] = Array.from({ length: 40 }, (_, index) => ({
+      role: index % 2 === 0 ? ('user' as const) : ('model' as const),
+      parts: [{ text: 'x'.repeat(perEntryChars) }],
+    }));
+    const first = decideExtractWindow({
+      cursor: { updatedAt: new Date(0).toISOString() },
+      sessionId: SESSION_ID,
+      curated,
+      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
+    });
+
+    expect(first.rebased).toBe(true);
+    // Half the 200k budget fits 10 entries.
+    expect(first.state.windowStartCurated).toBe(40 - 10);
     expect(
-      sliceExtractWindow(curated, decision.state.windowStartCurated).length,
-    ).toBe(EXTRACT_WINDOW_SEED_ENTRIES);
+      estimateExtractWindowChars(curated, first.state.windowStartCurated),
+    ).toBeLessThanOrEqual(DEFAULT_EXTRACT_WINDOW_MAX_CHARS / 2);
+
+    // The next run only appends turns: no immediate rebase loop.
+    const withAppendedTurns = [...curated, ...buildHistory(2, 'appended')];
+    const second = decideExtractWindow({
+      cursor: persistWindow(first.state),
+      sessionId: SESSION_ID,
+      curated: withAppendedTurns,
+      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
+    });
+
+    expect(second.rebased).toBe(false);
+    expect(second.state.epoch).toBe(first.state.epoch);
+    expect(second.state.windowStartCurated).toBe(
+      first.state.windowStartCurated,
+    );
+  });
+
+  it('keeps an oversized single entry as the seed instead of crashing', () => {
+    // One 300k-char entry exceeds even half the budget; the seed must still
+    // contain at least that newest entry.
+    const curated: Content[] = [
+      ...buildHistory(4),
+      { role: 'model', parts: [{ text: 'y'.repeat(300_000) }] },
+    ];
+    const decision = decideExtractWindow({
+      cursor: { updatedAt: new Date(0).toISOString() },
+      sessionId: SESSION_ID,
+      curated,
+      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
+    });
+
+    expect(decision.rebased).toBe(true);
+    expect(decision.state.windowStartCurated).toBe(curated.length - 1);
+    expect(
+      sliceExtractWindow(curated, decision.state.windowStartCurated),
+    ).toHaveLength(1);
   });
 
   it('handles an empty curated history', () => {
