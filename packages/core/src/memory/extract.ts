@@ -26,7 +26,6 @@ import {
   decideExtractWindow,
   isStableExtractionWindowEnabled,
   pickExtractWindowState,
-  resolveExtractWindowMaxChars,
   toExtractWindowCursorFields,
   type ExtractWindowState,
 } from './extract-window.js';
@@ -267,7 +266,6 @@ export async function runAutoMemoryExtract(params: {
         cursor: currentCursor,
         sessionId: params.sessionId,
         curated: curatedHistory,
-        maxChars: resolveExtractWindowMaxChars(),
       });
       windowState = decision.state;
       stableWindow = {

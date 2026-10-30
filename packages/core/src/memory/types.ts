@@ -102,9 +102,8 @@ export interface AutoMemoryExtractCursor {
   updatedAt: string;
   /**
    * Stable extraction window epoch. Bumped whenever the window start is
-   * rebased (session change, compaction, restart, head mismatch, budget
-   * overflow), so consecutive runs inside one epoch share an append-only
-   * prompt prefix.
+   * rebased (session change, compaction, restart, head mismatch), so
+   * consecutive runs inside one epoch share an append-only prompt prefix.
    */
   epoch?: number;
   /** Start index of the extractor window in CURATED-history coordinates. */

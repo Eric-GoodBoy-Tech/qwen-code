@@ -6,10 +6,6 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import type { Content } from '@google/genai';
-import {
-  DEFAULT_IMAGE_TOKEN_ESTIMATE,
-  estimateContentChars,
-} from '../services/compactionInputSlimming.js';
 import type { AutoMemoryExtractCursor } from './types.js';
 
 /**
@@ -21,23 +17,16 @@ import type { AutoMemoryExtractCursor } from './types.js';
  * for an "epoch": each run inherits curated[windowStartCurated..], which only
  * grows at the tail, keeping the inherited history an append-only prefix.
  *
- * The window is rebased (new epoch) whenever the pinned prefix can no longer
- * be trusted: session switch, process restart, history shrink/compaction,
- * head mismatch, or budget overflow.
+ * There is deliberately no size cap: the window grows with the session and is
+ * bounded only by the main session's own compaction. The window is rebased (new
+ * epoch) only when the pinned prefix is structurally invalidated: session
+ * switch, process restart, history shrink/compaction, or a changed head.
  */
 export const EXTRACT_STABLE_WINDOW_ENV =
   'QWEN_CODE_MEMORY_EXTRACT_STABLE_WINDOW';
 
-/** Optional char budget override before the pinned window is rebased. */
-export const EXTRACT_WINDOW_MAX_CHARS_ENV =
-  'QWEN_CODE_MEMORY_EXTRACT_STABLE_WINDOW_MAX_CHARS';
-
 /** Seed window size at epoch start — the legacy 40-entry extractor tail. */
 export const EXTRACT_WINDOW_SEED_ENTRIES = 40;
-
-// ~50k tokens. Long enough to amortize a rebase while staying well inside the
-// context windows of the models the extractor runs on.
-export const DEFAULT_EXTRACT_WINDOW_MAX_CHARS = 200_000;
 
 // Process-scoped marker persisted in the cursor: a different id proves the
 // cursor's curated indices came from a previous process and must be rebased.
@@ -52,8 +41,7 @@ export type ExtractWindowRebaseReason =
   | 'session_changed'
   | 'process_restarted'
   | 'history_shrank'
-  | 'head_changed'
-  | 'budget_overflow';
+  | 'head_changed';
 
 export interface ExtractWindowState {
   epoch: number;
@@ -84,19 +72,6 @@ export function isStableExtractionWindowEnabled(
   return true;
 }
 
-export function resolveExtractWindowMaxChars(
-  env: NodeJS.ProcessEnv = process.env,
-): number {
-  const raw = env[EXTRACT_WINDOW_MAX_CHARS_ENV];
-  if (raw === undefined || raw.trim() === '') {
-    return DEFAULT_EXTRACT_WINDOW_MAX_CHARS;
-  }
-  const parsed = Number(raw.trim());
-  return Number.isFinite(parsed) && parsed > 0
-    ? Math.floor(parsed)
-    : DEFAULT_EXTRACT_WINDOW_MAX_CHARS;
-}
-
 export function getExtractWindowHeadHash(
   curated: Content[],
   index: number,
@@ -106,17 +81,6 @@ export function getExtractWindowHeadHash(
   return createHash('sha256')
     .update(JSON.stringify({ role: content.role, parts: content.parts ?? [] }))
     .digest('hex');
-}
-
-export function estimateExtractWindowChars(
-  curated: Content[],
-  windowStartCurated: number,
-): number {
-  let total = 0;
-  for (let i = windowStartCurated; i < curated.length; i++) {
-    total += estimateContentChars(curated[i], DEFAULT_IMAGE_TOKEN_ESTIMATE);
-  }
-  return total;
 }
 
 /** The slice handed to the extractor for the current epoch. */
@@ -171,56 +135,25 @@ export function toExtractWindowCursorFields(
   };
 }
 
-/**
- * Budget-fitting epoch seed.
- *
- * The legacy seed (the newest 40 entries) can by itself exceed the window
- * budget in a busy session — measured curated windows there reach ~228k chars
- * — and a seed over budget would rebase on every single run, i.e. exactly the
- * zero-reuse loop this mode exists to remove. Seed instead from the newest
- * entries that fit into HALF the budget (always at least one entry, never more
- * than the legacy 40): the other half is headroom for appended turns before the
- * next rebase, so a rebase is an occasional event rather than the steady state.
- */
-function computeSeedWindowStart(curated: Content[], maxChars: number): number {
-  const budget = Math.max(1, Math.floor(maxChars / 2));
-  let usedChars = 0;
-  let entries = 0;
-  let start = curated.length;
-  for (let i = curated.length - 1; i >= 0; i--) {
-    if (entries >= EXTRACT_WINDOW_SEED_ENTRIES) break;
-    const chars = estimateContentChars(
-      curated[i],
-      DEFAULT_IMAGE_TOKEN_ESTIMATE,
-    );
-    if (entries > 0 && usedChars + chars > budget) break;
-    usedChars += chars;
-    entries++;
-    start = i;
-  }
-  return start;
-}
-
 export function decideExtractWindow(params: {
   cursor: AutoMemoryExtractCursor;
   sessionId: string;
   curated: Content[];
-  maxChars: number;
   processId?: string;
 }): ExtractWindowDecision {
-  const { cursor, sessionId, curated, maxChars } = params;
+  const { cursor, sessionId, curated } = params;
   const processId = params.processId ?? PROCESS_INSTANCE_ID;
   const length = curated.length;
-  const seedStart = computeSeedWindowStart(curated, maxChars);
+  const seedStart = Math.max(0, length - EXTRACT_WINDOW_SEED_ENTRIES);
   const existing = pickExtractWindowState(cursor);
 
   const rebase = (reason: ExtractWindowRebaseReason): ExtractWindowDecision => {
     let windowStartCurated = seedStart;
     // Never skip turns that no earlier run covered: when the previous window's
-    // covered index is older than the budget-fitting seed, start there instead.
-    // Safe for every rebase that still trusts the curated tail ordering
-    // (restart, head rewrite, shrink, budget) — a session change is the one
-    // case where `coveredCurated` belongs to another transcript.
+    // covered index is older than the fresh seed, start there instead. Safe for
+    // every structural rebase that still trusts the curated tail ordering
+    // (restart, head rewrite, shrink) — a session change is the one case where
+    // `coveredCurated` belongs to another transcript.
     if (
       reason !== 'session_changed' &&
       existing !== undefined &&
@@ -255,11 +188,6 @@ export function decideExtractWindow(params: {
     existing.windowHeadHash
   ) {
     return rebase('head_changed');
-  }
-  if (
-    estimateExtractWindowChars(curated, existing.windowStartCurated) > maxChars
-  ) {
-    return rebase('budget_overflow');
   }
   return {
     state: { ...existing, coveredCurated: length },

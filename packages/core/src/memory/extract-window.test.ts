@@ -8,15 +8,11 @@ import { describe, expect, it } from 'vitest';
 import type { Content } from '@google/genai';
 import type { AutoMemoryExtractCursor } from './types.js';
 import {
-  DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
   EXTRACT_STABLE_WINDOW_ENV,
-  EXTRACT_WINDOW_MAX_CHARS_ENV,
   decideExtractWindow,
-  estimateExtractWindowChars,
   getExtractWindowHeadHash,
   getExtractWindowProcessId,
   isStableExtractionWindowEnabled,
-  resolveExtractWindowMaxChars,
   sliceExtractWindow,
   toExtractWindowCursorFields,
   type ExtractWindowState,
@@ -63,27 +59,12 @@ describe('stable extraction window', () => {
     }
   });
 
-  it('resolves the char budget with env override and safe fallbacks', () => {
-    expect(resolveExtractWindowMaxChars({})).toBe(
-      DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
-    );
-    expect(
-      resolveExtractWindowMaxChars({ [EXTRACT_WINDOW_MAX_CHARS_ENV]: '5000' }),
-    ).toBe(5000);
-    for (const value of ['nope', '-1', '0', '']) {
-      expect(
-        resolveExtractWindowMaxChars({ [EXTRACT_WINDOW_MAX_CHARS_ENV]: value }),
-      ).toBe(DEFAULT_EXTRACT_WINDOW_MAX_CHARS);
-    }
-  });
-
   it('seeds a fresh epoch from the legacy 40-entry tail on a cold start', () => {
     const curated = buildHistory(100);
     const decision = decideExtractWindow({
       cursor: { updatedAt: new Date(0).toISOString() },
       sessionId: SESSION_ID,
       curated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
 
     expect(decision.rebased).toBe(true);
@@ -106,7 +87,6 @@ describe('stable extraction window', () => {
       cursor: legacy,
       sessionId: SESSION_ID,
       curated: buildHistory(10),
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
 
     expect(decision.rebased).toBe(true);
@@ -121,7 +101,6 @@ describe('stable extraction window', () => {
       cursor: { updatedAt: new Date(0).toISOString() },
       sessionId: SESSION_ID,
       curated: firstCurated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
     const cursor = persistWindow(first.state);
 
@@ -130,7 +109,6 @@ describe('stable extraction window', () => {
       cursor,
       sessionId: SESSION_ID,
       curated: secondCurated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
 
     expect(second.rebased).toBe(false);
@@ -157,7 +135,6 @@ describe('stable extraction window', () => {
       cursor: { updatedAt: new Date(0).toISOString() },
       sessionId: SESSION_ID,
       curated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
     const cursor = persistWindow(first.state);
 
@@ -166,7 +143,6 @@ describe('stable extraction window', () => {
       cursor,
       sessionId: SESSION_ID,
       curated: compacted,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
 
     expect(decision.rebased).toBe(true);
@@ -184,13 +160,11 @@ describe('stable extraction window', () => {
       cursor: { updatedAt: new Date(0).toISOString() },
       sessionId: SESSION_ID,
       curated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
     const decision = decideExtractWindow({
       cursor: persistWindow(first.state),
       sessionId: 'session-2',
       curated: buildHistory(100),
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
 
     expect(decision.rebased).toBe(true);
@@ -204,7 +178,6 @@ describe('stable extraction window', () => {
       cursor: { updatedAt: new Date(0).toISOString() },
       sessionId: SESSION_ID,
       curated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
       processId: 'process-before-restart',
     });
     const cursor = persistWindow(first.state);
@@ -213,7 +186,6 @@ describe('stable extraction window', () => {
       cursor: { ...cursor, windowProcessId: 'process-before-restart' },
       sessionId: SESSION_ID,
       curated: buildHistory(104),
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
       processId: 'process-after-restart',
     });
 
@@ -227,60 +199,17 @@ describe('stable extraction window', () => {
       cursor: { updatedAt: new Date(0).toISOString() },
       sessionId: SESSION_ID,
       curated: buildHistory(100),
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
     const decision = decideExtractWindow({
       cursor: persistWindow(first.state),
       sessionId: SESSION_ID,
       curated: buildHistory(30),
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
 
     expect(decision.rebased).toBe(true);
     expect(decision.reason).toBe('history_shrank');
     expect(decision.state.windowStartCurated).toBe(0);
     expect(decision.state.coveredCurated).toBe(30);
-  });
-
-  it('rebases on budget overflow without dropping the uncovered tail', () => {
-    // Epoch pinned at curated[0] and covered only the first 100 entries.
-    const firstCurated = buildHistory(100);
-    const first = decideExtractWindow({
-      cursor: { updatedAt: new Date(0).toISOString() },
-      sessionId: SESSION_ID,
-      curated: firstCurated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
-    });
-    expect(first.state.windowStartCurated).toBe(60);
-
-    // A pinned window from entry 0 that covered 100 entries, now 200 long and
-    // over budget: the rebase must keep entries 100..199 (never covered).
-    const longCurated = buildHistory(200);
-    const pinnedAtZero: ExtractWindowState = {
-      epoch: 3,
-      windowStartCurated: 0,
-      coveredCurated: 100,
-      windowHeadHash: getExtractWindowHeadHash(longCurated, 0),
-    };
-    const decision = decideExtractWindow({
-      cursor: persistWindow(pinnedAtZero),
-      sessionId: SESSION_ID,
-      curated: longCurated,
-      maxChars: 1,
-    });
-
-    expect(decision.rebased).toBe(true);
-    expect(decision.reason).toBe('budget_overflow');
-    expect(decision.state.epoch).toBe(4);
-    // The budget-fitting seed would start after the last covered entry, so the
-    // no-loss clamp starts at 100 instead.
-    expect(decision.state.windowStartCurated).toBe(100);
-    const window = sliceExtractWindow(
-      longCurated,
-      decision.state.windowStartCurated,
-    );
-    expect(window[0]).toEqual(longCurated[100]);
-    expect(window[window.length - 1]).toEqual(longCurated[199]);
   });
 
   it('applies the no-loss clamp to head_changed rebases too', () => {
@@ -299,72 +228,12 @@ describe('stable extraction window', () => {
       cursor: persistWindow(pinnedAtZero),
       sessionId: SESSION_ID,
       curated: rewritten,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
 
     expect(decision.reason).toBe('head_changed');
-    // Budget-fitting seed would be rewritten[160], but entry 100 is the oldest
-    // never-covered turn.
+    // The fresh 40-entry seed would be rewritten[160], but entry 100 is the
+    // oldest never-covered turn.
     expect(decision.state.windowStartCurated).toBe(100);
-  });
-
-  it('seeds a 40-entry window that by itself exceeds the budget with budget headroom', () => {
-    // A busy session: 40 entries of ~10k chars each = ~400k chars, well over
-    // the 200k budget. A legacy 40-entry seed would rebase on every run.
-    const perEntryChars = 10_000;
-    const curated: Content[] = Array.from({ length: 40 }, (_, index) => ({
-      role: index % 2 === 0 ? ('user' as const) : ('model' as const),
-      parts: [{ text: 'x'.repeat(perEntryChars) }],
-    }));
-    const first = decideExtractWindow({
-      cursor: { updatedAt: new Date(0).toISOString() },
-      sessionId: SESSION_ID,
-      curated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
-    });
-
-    expect(first.rebased).toBe(true);
-    // Half the 200k budget fits 10 entries.
-    expect(first.state.windowStartCurated).toBe(40 - 10);
-    expect(
-      estimateExtractWindowChars(curated, first.state.windowStartCurated),
-    ).toBeLessThanOrEqual(DEFAULT_EXTRACT_WINDOW_MAX_CHARS / 2);
-
-    // The next run only appends turns: no immediate rebase loop.
-    const withAppendedTurns = [...curated, ...buildHistory(2, 'appended')];
-    const second = decideExtractWindow({
-      cursor: persistWindow(first.state),
-      sessionId: SESSION_ID,
-      curated: withAppendedTurns,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
-    });
-
-    expect(second.rebased).toBe(false);
-    expect(second.state.epoch).toBe(first.state.epoch);
-    expect(second.state.windowStartCurated).toBe(
-      first.state.windowStartCurated,
-    );
-  });
-
-  it('keeps an oversized single entry as the seed instead of crashing', () => {
-    // One 300k-char entry exceeds even half the budget; the seed must still
-    // contain at least that newest entry.
-    const curated: Content[] = [
-      ...buildHistory(4),
-      { role: 'model', parts: [{ text: 'y'.repeat(300_000) }] },
-    ];
-    const decision = decideExtractWindow({
-      cursor: { updatedAt: new Date(0).toISOString() },
-      sessionId: SESSION_ID,
-      curated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
-    });
-
-    expect(decision.rebased).toBe(true);
-    expect(decision.state.windowStartCurated).toBe(curated.length - 1);
-    expect(
-      sliceExtractWindow(curated, decision.state.windowStartCurated),
-    ).toHaveLength(1);
   });
 
   it('handles an empty curated history', () => {
@@ -372,7 +241,6 @@ describe('stable extraction window', () => {
       cursor: { updatedAt: new Date(0).toISOString() },
       sessionId: SESSION_ID,
       curated: [],
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
 
     expect(decision.rebased).toBe(true);
@@ -387,7 +255,6 @@ describe('stable extraction window', () => {
       cursor: { updatedAt: new Date(0).toISOString() },
       sessionId: SESSION_ID,
       curated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
     const persisted = persistWindow(first.state);
     expect(persisted.windowProcessId).toBe(getExtractWindowProcessId());
@@ -400,7 +267,6 @@ describe('stable extraction window', () => {
       cursor: persisted,
       sessionId: SESSION_ID,
       curated: secondCurated,
-      maxChars: DEFAULT_EXTRACT_WINDOW_MAX_CHARS,
     });
     expect(second.rebased).toBe(false);
     expect(second.state.coveredCurated).toBe(105);
